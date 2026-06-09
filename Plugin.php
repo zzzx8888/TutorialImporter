@@ -35,104 +35,115 @@ class Plugin extends AbstractPlugin
     {
         $config = $this->getConfig();
 
-        // Handle Immediate Import (runs every minute if flag is set)
-        if (isset($config['immediate_import']) && $config['immediate_import'] === '1') {
-            $schedule->call(function () {
-                try {
-                    Log::info('Tutorial Importer: Starting immediate import...');
-                    $service = new TutorialImportService();
-                    $service->import();
+        // Handle Immediate Import — always register the task, check flag inside callback
+        $schedule->call(function () {
+            $configService = app(PluginConfigService::class);
+            $fullConfig = $configService->getDbConfig('tutorial_importer');
 
-                    // Reset config flag
-                    $configService = app(PluginConfigService::class);
-                    $fullConfig = $configService->getDbConfig('tutorial_importer');
-                    $fullConfig['immediate_import'] = '0';
+            if (!isset($fullConfig['immediate_import']) || $fullConfig['immediate_import'] !== '1') {
+                return;
+            }
+
+            // Reset flag first to prevent retry loops on failure
+            $fullConfig['immediate_import'] = '0';
+            $configService->updateConfig('tutorial_importer', $fullConfig);
+
+            try {
+                Log::info('Tutorial Importer: Starting immediate import...');
+                $service = new TutorialImportService();
+                $result = $service->import();
+                $fullConfig['import_status'] = "导入成功: 总计{$result['total']}, 成功{$result['success']}, 失败{$result['failed']}";
+                $fullConfig['last_import_time'] = now()->toDateTimeString();
+                $configService->updateConfig('tutorial_importer', $fullConfig);
+                Log::info('Tutorial Importer: Immediate import completed.');
+            } catch (\Exception $e) {
+                Log::error('Tutorial Importer: Immediate import failed: ' . $e->getMessage());
+                $fullConfig['import_status'] = "导入失败: " . $e->getMessage();
+                $fullConfig['last_import_time'] = now()->toDateTimeString();
+                $configService->updateConfig('tutorial_importer', $fullConfig);
+            }
+        })->everyMinute();
+
+        // Handle Plugin Update Actions — always register the task, check flag inside callback
+        $schedule->call(function () {
+            $configService = app(PluginConfigService::class);
+            $fullConfig = $configService->getDbConfig('tutorial_importer');
+            $action = $fullConfig['update_action'] ?? 'none';
+
+            if ($action === 'none') {
+                return;
+            }
+
+            // Reset flag first to prevent retry loops on failure
+            $fullConfig['update_action'] = 'none';
+            $configService->updateConfig('tutorial_importer', $fullConfig);
+
+            try {
+                $updateService = new PluginUpdateService();
+
+                if ($action === 'check') {
+                    Log::info('Tutorial Importer: Checking for updates...');
+                    $result = $updateService->checkUpdate();
+
+                    $fullConfig['update_status'] = $result['message'];
                     $configService->updateConfig('tutorial_importer', $fullConfig);
+                    Log::info('Tutorial Importer: Update check completed: ' . $result['message']);
 
-                    Log::info('Tutorial Importer: Immediate import completed and flag reset.');
-                } catch (\Exception $e) {
-                    Log::error('Tutorial Importer: Immediate import failed: ' . $e->getMessage());
-                }
-            })->everyMinute();
-        }
-
-        // Handle Plugin Update Actions
-        if (isset($config['update_action']) && $config['update_action'] !== 'none') {
-            $schedule->call(function () use ($config) {
-                try {
-                    $action = $config['update_action'];
-                    $updateService = new PluginUpdateService();
-                    $configService = app(PluginConfigService::class);
-                    $fullConfig = $configService->getDbConfig('tutorial_importer');
-
-                    if ($action === 'check') {
-                        Log::info('Tutorial Importer: Checking for updates...');
-                        $result = $updateService->checkUpdate();
-
-                        $fullConfig['update_status'] = $result['message'];
-                        $fullConfig['update_action'] = 'none';
-
-                        $configService->updateConfig('tutorial_importer', $fullConfig);
-                        Log::info('Tutorial Importer: Update check completed: ' . $result['message']);
-
-                    } elseif ($action === 'update') {
-                        Log::info('Tutorial Importer: Starting update process...');
-                        $check = $updateService->checkUpdate();
-                        if ($check['has_update']) {
-                             if ($updateService->performUpdate($check['download_url'])) {
-                                 $fullConfig['update_status'] = "更新成功！当前版本：" . $check['latest_version'];
-                             } else {
-                                 $fullConfig['update_status'] = "更新失败，请查看日志。";
-                             }
-                        } else {
-                             $fullConfig['update_status'] = "当前已是最新版本，无需更新。";
-                        }
-                        $fullConfig['update_action'] = 'none';
-                        $configService->updateConfig('tutorial_importer', $fullConfig);
-                        Log::info('Tutorial Importer: Update process finished.');
+                } elseif ($action === 'update') {
+                    Log::info('Tutorial Importer: Starting update process...');
+                    $check = $updateService->checkUpdate();
+                    if ($check['has_update']) {
+                         if ($updateService->performUpdate($check['download_url'])) {
+                             $fullConfig['update_status'] = "更新成功！当前版本：" . $check['latest_version'];
+                         } else {
+                             $fullConfig['update_status'] = "更新失败，请查看日志。";
+                         }
+                    } else {
+                         $fullConfig['update_status'] = "当前已是最新版本，无需更新。";
                     }
-
-                } catch (\Exception $e) {
-                    Log::error('Tutorial Importer: Update action failed: ' . $e->getMessage());
-                    // Reset action to prevent infinite loop of error
-                    try {
-                        $configService = app(PluginConfigService::class);
-                        $fullConfig = $configService->getDbConfig('tutorial_importer');
-                        $fullConfig['update_action'] = 'none';
-                        $fullConfig['update_status'] = "操作失败：" . $e->getMessage();
-                        $configService->updateConfig('tutorial_importer', $fullConfig);
-                    } catch (\Exception $ex) {}
-                }
-            })->everyMinute();
-        }
-
-        // Handle Knowledge Base Cleanup
-        if (isset($config['cleanup_action']) && $config['cleanup_action'] === 'clear') {
-            $schedule->call(function () {
-                try {
-                    Log::info('Tutorial Importer: Starting knowledge base cleanup...');
-                    $service = new TutorialImportService();
-                    $service->clearAll();
-
-                    $configService = app(PluginConfigService::class);
-                    $fullConfig = $configService->getDbConfig('tutorial_importer');
-                    $fullConfig['cleanup_action'] = 'none';
-                    $fullConfig['cleanup_status'] = "清理成功：" . now()->toDateTimeString();
                     $configService->updateConfig('tutorial_importer', $fullConfig);
-
-                    Log::info('Tutorial Importer: Knowledge base cleanup completed.');
-                } catch (\Exception $e) {
-                    Log::error('Tutorial Importer: Cleanup failed: ' . $e->getMessage());
-                    try {
-                        $configService = app(PluginConfigService::class);
-                        $fullConfig = $configService->getDbConfig('tutorial_importer');
-                        $fullConfig['cleanup_action'] = 'none';
-                        $fullConfig['cleanup_status'] = "清理失败：" . $e->getMessage();
-                        $configService->updateConfig('tutorial_importer', $fullConfig);
-                    } catch (\Exception $ex) {}
+                    Log::info('Tutorial Importer: Update process finished.');
                 }
-            })->everyMinute();
-        }
+
+            } catch (\Exception $e) {
+                Log::error('Tutorial Importer: Update action failed: ' . $e->getMessage());
+                try {
+                    $fullConfig['update_status'] = "操作失败：" . $e->getMessage();
+                    $configService->updateConfig('tutorial_importer', $fullConfig);
+                } catch (\Exception $ex) {}
+            }
+        })->everyMinute();
+
+        // Handle Knowledge Base Cleanup — always register the task, check flag inside callback
+        $schedule->call(function () {
+            $configService = app(PluginConfigService::class);
+            $fullConfig = $configService->getDbConfig('tutorial_importer');
+
+            if (!isset($fullConfig['cleanup_action']) || $fullConfig['cleanup_action'] !== 'clear') {
+                return;
+            }
+
+            // Reset flag first to prevent retry loops on failure
+            $fullConfig['cleanup_action'] = 'none';
+            $configService->updateConfig('tutorial_importer', $fullConfig);
+
+            try {
+                Log::info('Tutorial Importer: Starting knowledge base cleanup...');
+                $service = new TutorialImportService();
+                $service->clearAll();
+
+                $fullConfig['cleanup_status'] = "清理成功：" . now()->toDateTimeString();
+                $configService->updateConfig('tutorial_importer', $fullConfig);
+
+                Log::info('Tutorial Importer: Knowledge base cleanup completed.');
+            } catch (\Exception $e) {
+                Log::error('Tutorial Importer: Cleanup failed: ' . $e->getMessage());
+                try {
+                    $fullConfig['cleanup_status'] = "清理失败：" . $e->getMessage();
+                    $configService->updateConfig('tutorial_importer', $fullConfig);
+                } catch (\Exception $ex) {}
+            }
+        })->everyMinute();
 
         // Handle Scheduled Sync
         $interval = $config['sync_interval'] ?? 'never';

@@ -89,8 +89,16 @@ class PluginUpdateService
      */
     public function performUpdate(string $downloadUrl): bool
     {
-        $tempZip = storage_path('app/tutorial-importer-update.zip');
-        $extractPath = storage_path('app/tutorial-importer-extract');
+        // Use a temporary directory inside the plugin folder to ensure write permissions
+        // as the storage directory structure might be restricted in Docker.
+        $tempDir = $this->pluginPath . '/.update_tmp';
+        
+        if (!File::exists($tempDir)) {
+            File::makeDirectory($tempDir, 0755, true);
+        }
+
+        $tempZip = $tempDir . '/update.zip';
+        $extractPath = $tempDir . '/extract';
 
         try {
             Log::info("Tutorial Importer: Downloading update from {$downloadUrl}...");
@@ -129,8 +137,7 @@ class PluginUpdateService
             File::copyDirectory($sourcePath, $this->pluginPath);
 
             // 5. Cleanup
-            File::delete($tempZip);
-            File::deleteDirectory($extractPath);
+            File::deleteDirectory($tempDir);
 
             Log::info("Tutorial Importer: Update completed successfully.");
             return true;
@@ -138,8 +145,7 @@ class PluginUpdateService
         } catch (\Exception $e) {
             Log::error("Tutorial Importer: Update failed: " . $e->getMessage());
             // Cleanup on fail
-            if (File::exists($tempZip)) File::delete($tempZip);
-            if (File::exists($extractPath)) File::deleteDirectory($extractPath);
+            if (File::exists($tempDir)) File::deleteDirectory($tempDir);
             return false;
         }
     }

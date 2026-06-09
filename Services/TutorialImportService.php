@@ -31,11 +31,14 @@ class TutorialImportService
             }, $fullConfig);
         } catch (\Exception $e) {
             Log::warning('Tutorial Import: Failed to load config: ' . $e->getMessage());
+            $this->config = [];
         }
     }
 
     public function import(): array
     {
+        Log::info('Tutorial Import: Starting import...');
+
         // Check if remote sync is configured
         $this->syncFromRemote();
 
@@ -45,11 +48,21 @@ class TutorialImportService
 
         try {
             $content = File::get($this->summaryFile);
-            $yamlContent = preg_replace('/^---\s*\n/', '', $content);
+
+            // Strip YAML frontmatter markers (---) if present
+            $yamlContent = trim(preg_replace('/^---\s*\n/', '', $content));
+            // Remove trailing --- if present (YAML document separator)
+            $yamlContent = preg_replace('/\n---\s*$/', '', $yamlContent);
+
             $summary = Yaml::parse($yamlContent);
+            if (!is_array($summary)) {
+                throw new \Exception('SUMMARY.md did not parse into a valid array');
+            }
         } catch (\Exception $e) {
             throw new \Exception('Failed to parse SUMMARY.md: ' . $e->getMessage());
         }
+
+        Log::info('Tutorial Import: SUMMARY parsed, root keys: ' . implode(', ', array_keys($summary)));
 
         $results = [
             'total' => 0,
@@ -59,15 +72,22 @@ class TutorialImportService
         ];
 
         foreach ($summary as $langKey => $categories) {
-            if (!isset($this->supportedLangs[$langKey])) {
+            $dbLang = $this->supportedLangs[$langKey] ?? $langKey;
+            if (!is_array($categories)) {
+                Log::warning("Tutorial Import: Skipping lang '{$langKey}' — categories is not an array");
                 continue;
             }
-            $dbLang = $this->supportedLangs[$langKey];
+
+            Log::info("Tutorial Import: Processing lang '{$langKey}' (db: {$dbLang}), " . count($categories) . ' categories');
 
             foreach ($categories as $categoryData) {
+                if (!is_array($categoryData) || !isset($categoryData['title'])) {
+                    Log::warning("Tutorial Import: Skipping invalid category entry: " . json_encode($categoryData, JSON_UNESCAPED_UNICODE));
+                    continue;
+                }
                 $categoryName = $categoryData['title'];
 
-                if (isset($categoryData['subItems'])) {
+                if (isset($categoryData['subItems']) && is_array($categoryData['subItems'])) {
                     foreach ($categoryData['subItems'] as $item) {
                         $results['total']++;
                         try {
@@ -88,9 +108,13 @@ class TutorialImportService
                          $results['failed']++;
                          $results['errors'][] = "Failed to import {$categoryData['title']} ($dbLang): " . $e->getMessage();
                      }
+                } else {
+                    Log::warning("Tutorial Import: Category '{$categoryName}' has neither subItems nor path, skipping");
                 }
             }
         }
+
+        Log::info("Tutorial Import: Finished. Total: {$results['total']}, Success: {$results['success']}, Failed: {$results['failed']}");
 
         return $results;
     }
@@ -99,23 +123,28 @@ class TutorialImportService
     {
         $repoUrl = $this->config['repository_url'] ?? '';
         if (empty($repoUrl)) {
+            Log::info('Tutorial Import: No repository_url configured, using local files.');
             return;
         }
 
+        Log::info("Tutorial Import: repository_url configured: {$repoUrl}");
         $branch = $this->config['branch'] ?? 'main';
         $targetDir = $this->basePath;
 
         // Check if git is installed
-        exec('git --version', $output, $returnVar);
-        if ($returnVar !== 0) {
-            Log::error("Tutorial Import: Git is not installed on the server.");
+        $result = exec('git --version 2>&1', $output, $returnVar);
+        if ($returnVar !== 0 || $result === false) {
+            Log::error("Tutorial Import: Git is not available on the server. exec returned: " . ($result === false ? 'false' : $result));
             return;
         }
+
+        // Mark the target directory as safe for git (Docker/container environments)
+        exec('git config --global --add safe.directory ' . escapeshellarg($targetDir) . ' 2>/dev/null');
 
         if (File::exists($targetDir . '/.git')) {
             // Pull changes
             Log::info("Tutorial Import: Pulling changes from $repoUrl ($branch)...");
-            $command = "cd " . escapeshellarg($targetDir) . " && git fetch origin && git reset --hard origin/" . escapeshellarg($branch);
+            $command = "cd " . escapeshellarg($targetDir) . " && git fetch origin 2>&1 && git reset --hard origin/" . escapeshellarg($branch) . " 2>&1";
         } else {
             // Clone repo
             Log::info("Tutorial Import: Cloning $repoUrl ($branch)...");
@@ -123,18 +152,26 @@ class TutorialImportService
             if (File::exists($targetDir)) {
                  File::deleteDirectory($targetDir);
             }
-            $command = "git clone -b " . escapeshellarg($branch) . " " . escapeshellarg($repoUrl) . " " . escapeshellarg($targetDir);
+            $command = "git clone -b " . escapeshellarg($branch) . " " . escapeshellarg($repoUrl) . " " . escapeshellarg($targetDir) . " 2>&1";
         }
 
-        exec($command . ' 2>&1', $output, $returnVar);
+        Log::info("Tutorial Import: Executing: $command");
+        exec($command, $output, $returnVar);
+
+        $outputText = implode("\n", $output);
+        Log::info("Tutorial Import: Git output: " . substr($outputText, 0, 1000));
 
         if ($returnVar !== 0) {
-            $errorMsg = implode("\n", $output);
+            $errorMsg = !empty($outputText) ? $outputText : "exec returned code {$returnVar}";
             Log::error("Tutorial Import: Git sync failed: $errorMsg");
             throw new \Exception("Git sync failed: $errorMsg");
         }
 
         Log::info("Tutorial Import: Git sync completed successfully.");
+        // Verify the target directory exists after sync
+        if (!File::exists($targetDir)) {
+            throw new \Exception("Git sync completed but target directory does not exist: {$targetDir}");
+        }
     }
 
     private function processItem(array $item, string $lang, string $category)
@@ -168,6 +205,7 @@ class TutorialImportService
             $knowledge->update([
                 'body' => $body
             ]);
+            Log::info("Tutorial Import: Updated article '{$item['title']}' ({$lang}/{$category})");
         } else {
             Knowledge::create([
                 'title' => $item['title'],
@@ -177,6 +215,7 @@ class TutorialImportService
                 'sort' => 0,
                 'show' => true,
             ]);
+            Log::info("Tutorial Import: Created article '{$item['title']}' ({$lang}/{$category})");
         }
     }
 

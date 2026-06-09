@@ -1,7 +1,7 @@
 {
     "name": "Tutorial Importer",
     "description": "将教程 markdown 文件导入到 Xboard 知识库，并支持 Git 同步。",
-    "version": "1.1.2",
+    "version": "1.1.6",
     "type": "feature",
     "code": "tutorial_importer",
     "author": "User",
@@ -89,6 +89,18 @@
             "name": "清理状态",
             "description": "显示最近一次清理的结果 (只读)。",
             "default": "未知"
+        },
+        "import_status": {
+            "type": "text",
+            "name": "导入状态",
+            "description": "显示最近一次导入任务的结果（只读）。",
+            "default": "未执行"
+        },
+        "last_import_time": {
+            "type": "text",
+            "name": "最后导入时间",
+            "description": "显示最近一次导入任务的执行时间（只读）。",
+            "default": ""
         }
     }
 }
